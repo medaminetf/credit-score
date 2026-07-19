@@ -363,7 +363,7 @@ with st.sidebar:
     st.header("Sélection")
     fichier = st.file_uploader("Fichier Excel des émetteurs", type=["xlsx"])
 
-NOMS_PAR_DEFAUT = ["Data-Emetteurs.xlsx", "Liste_Emetteurs.xlsx"]
+NOMS_PAR_DEFAUT = ["Data-Emetteurs.xlsx", "Liste_Emetteurs (2).xlsx"]
 defaut = next((Path(__file__).parent / n for n in NOMS_PAR_DEFAUT if (Path(__file__).parent / n).exists()), None)
 
 if fichier is not None:
