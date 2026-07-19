@@ -128,37 +128,138 @@ def _div(a, b):
     return a / b
 
 # ----------------------------------------------------------------------------
-# Lecture du fichier Excel
+# Lecture robuste du fichier Excel — s'adapte à différentes mises en forme
+# (nom des feuilles, ligne d'en-tête, ordre/orthographe des colonnes)
 # ----------------------------------------------------------------------------
+
+import re
+import unicodedata
+
+
+def _norm(s):
+    """Normalise un libellé : sans accents, minuscules, espaces compactés."""
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
+    s = s.lower().strip()
+    s = re.sub(r"[’']", "'", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+# Alias possibles pour chaque champ requis (on matche par normalisation)
+ALIASES = {
+    "societes":              ["societes", "societe", "emetteur", "emetteurs"],
+    "capitaux_propres":      ["capitaux propres", "capitaux propre"],
+    "total_actif":           ["total actif", "total actifs"],
+    "dettes_subordonnees":   ["dettes subordonnees", "dette subordonnee"],
+    "etablissements_credit": ["etablissements de credits", "etablissement de credit", "etablissements de credit"],
+    "dettes_clientele":      ["dettes envers la clientele", "dette envers la clientele"],
+    "autres_dettes_titre":   ["autre dettes representees par un titre", "autres dettes representees par un titre"],
+    "pnb":                   ["produit net bancaire", "pnb"],
+    "produits_interet":      ["produits d'interet", "produit d'interet"],
+    "charges_interet":       ["charges d'interets", "charge d'interets", "charges d'interet"],
+    "dette_nette":           ["dette nette"],
+    "resultat_exploitation": ["resultat d'exploitation", "resultat dexploitation"],
+    "ebitda":                ["ebitda"],
+    "frais_financiers":      ["charges d'interet (frais financiers)", "frais financiers",
+                              "charges d'interets (frais financiers)"],
+    "type":                  ["type"],
+    "secteur":               ["secteur"],
+}
+
+
+def _map_columns(columns):
+    """Associe chaque clé canonique (ALIASES) à son nom de colonne réel, si présent."""
+    norm_map = {c: _norm(c) for c in columns}
+    mapping = {}
+    for key, aliases in ALIASES.items():
+        aliases_norm = {_norm(a) for a in aliases}
+        for orig, norm in norm_map.items():
+            if norm in aliases_norm:
+                mapping[key] = orig
+                break
+    return mapping
+
+
+def _detect_header_row(ws, max_scan=5):
+    """Trouve la ligne (1-indexée) contenant l'en-tête 'Societes'/'Emetteur'."""
+    societes_aliases = {_norm(a) for a in ALIASES["societes"]}
+    for r in range(1, max_scan + 1):
+        for cell in ws[r]:
+            if _norm(cell.value) in societes_aliases:
+                return r
+    return 1  # repli : première ligne
+
+
+def _find_sheet(sheetnames, keywords):
+    """Trouve la première feuille dont le nom normalisé contient un des mots-clés."""
+    for name in sheetnames:
+        n = _norm(name)
+        if any(k in n for k in keywords):
+            return name
+    return None
+
 
 @st.cache_data(show_spinner=False)
 def charger_donnees(contenu: bytes):
+    import openpyxl
+
+    wb = openpyxl.load_workbook(io.BytesIO(contenu), read_only=True, data_only=True)
+    sheetnames = wb.sheetnames
+
+    sheet_fin = _find_sheet(sheetnames, ["financ"])
+    sheet_corp = _find_sheet(sheetnames, ["corporate", "corpo"])
+    sheet_univers = _find_sheet(sheetnames, ["feuil1", "univers", "liste"])
+
+    if sheet_fin is None or sheet_corp is None:
+        raise ValueError(
+            "Impossible de repérer les feuilles 'financier' et 'corporate' dans ce fichier. "
+            f"Feuilles trouvées : {sheetnames}"
+        )
+
     xls = pd.ExcelFile(io.BytesIO(contenu))
 
-    # --- Univers (Feuil1) -------------------------------------------------
-    univers = pd.read_excel(xls, "Feuil1")
-    univers.columns = [c.strip() for c in univers.columns]
-    univers = univers.dropna(subset=["Emetteur"])
+    # --- Univers (optionnel) ----------------------------------------------
+    univers = None
+    if sheet_univers is not None:
+        header_u = _detect_header_row(wb[sheet_univers])
+        raw_u = pd.read_excel(xls, sheet_univers, header=header_u - 1)
+        raw_u.columns = [str(c).strip() for c in raw_u.columns]
+        cmap_u = _map_columns(raw_u.columns)
+        if "societes" in cmap_u:
+            univers = pd.DataFrame({
+                "Emetteur": raw_u[cmap_u["societes"]].astype(str).str.strip(),
+                "Type": raw_u[cmap_u["type"]] if "type" in cmap_u else None,
+                "Secteur": raw_u[cmap_u["secteur"]] if "secteur" in cmap_u else None,
+            }).dropna(subset=["Emetteur"])
+            univers = univers[univers["Emetteur"].str.len() > 0]
 
-    # --- Sociétés financières --------------------------------------------
-    fin_raw = pd.read_excel(xls, "financier", header=1)
-    fin_raw = fin_raw.loc[:, ~fin_raw.columns.astype(str).str.startswith("Unnamed")]
+    # --- Sociétés financières ----------------------------------------------
+    header_f = _detect_header_row(wb[sheet_fin])
+    fin_raw = pd.read_excel(xls, sheet_fin, header=header_f - 1)
     fin_raw.columns = [str(c).strip() for c in fin_raw.columns]
+    fin_raw = fin_raw.loc[:, ~fin_raw.columns.str.startswith("Unnamed")]
+    cmap_f = _map_columns(fin_raw.columns)
+
+    def g(row, key):
+        col = cmap_f.get(key)
+        return _num(row.get(col)) if col else None
 
     fin_rows = []
     for _, r in fin_raw.iterrows():
-        nom = r.get("Societes")
+        nom = r.get(cmap_f.get("societes"))
         if not isinstance(nom, str) or not nom.strip():
             continue
-        cp   = _num(r.get("Capitaux propre"))
-        ta   = _num(r.get("Total actif"))
-        dsub = _num(r.get("Dettes subordonnees"))
-        ec   = _num(r.get("Etablissements de credits"))
-        dcl  = _num(r.get("dettes envers la clientele"))
-        adt  = _num(r.get("autre dettes representees par un titre"))
-        pnb  = _num(r.get("Produit net bancaire"))
-        pi   = _num(r.get("Produits d'interet"))
-        ci   = _num(r.get("charges d'interets"))
+        cp   = g(r, "capitaux_propres")
+        ta   = g(r, "total_actif")
+        dsub = g(r, "dettes_subordonnees")
+        ec   = g(r, "etablissements_credit")
+        dcl  = g(r, "dettes_clientele")
+        adt  = g(r, "autres_dettes_titre")
+        pnb  = g(r, "pnb")
+        pi   = g(r, "produits_interet")
+        ci   = g(r, "charges_interet")
 
         exigible = None
         parts = [dsub, ec, dcl, adt]
@@ -180,21 +281,27 @@ def charger_donnees(contenu: bytes):
         })
     df_fin = pd.DataFrame(fin_rows)
 
-    # --- Corporates -------------------------------------------------------
-    corp_raw = pd.read_excel(xls, "corporate", header=1)
-    corp_raw = corp_raw.loc[:, ~corp_raw.columns.astype(str).str.startswith("Unnamed")]
+    # --- Corporates ----------------------------------------------------------
+    header_c = _detect_header_row(wb[sheet_corp])
+    corp_raw = pd.read_excel(xls, sheet_corp, header=header_c - 1)
     corp_raw.columns = [str(c).strip() for c in corp_raw.columns]
+    corp_raw = corp_raw.loc[:, ~corp_raw.columns.str.startswith("Unnamed")]
+    cmap_c = _map_columns(corp_raw.columns)
+
+    def gc(row, key):
+        col = cmap_c.get(key)
+        return _num(row.get(col)) if col else None
 
     corp_rows = []
     for _, r in corp_raw.iterrows():
-        nom = r.get("Societes")
+        nom = r.get(cmap_c.get("societes"))
         if not isinstance(nom, str) or not nom.strip():
             continue
-        cp     = _num(r.get("Capitaux propres"))
-        dn     = _num(r.get("Dette nette"))
-        rex    = _num(r.get("Resultat d'exploitation"))
-        ebitda = _num(r.get("EBITDA"))
-        ff     = _num(r.get("Charges d'interet (Frais financiers)"))
+        cp     = gc(r, "capitaux_propres")
+        dn     = gc(r, "dette_nette")
+        rex    = gc(r, "resultat_exploitation")
+        ebitda = gc(r, "ebitda")
+        ff     = gc(r, "frais_financiers")
 
         # EBITDA de repli : résultat d'exploitation si l'EBITDA manque
         if ebitda is None:
@@ -214,6 +321,15 @@ def charger_donnees(contenu: bytes):
             "Score": moy, "Note finale": lettre,
         })
     df_corp = pd.DataFrame(corp_rows)
+
+    # --- Univers de repli : si aucune feuille Type/Secteur n'existe --------
+    if univers is None:
+        combo = pd.concat([df_fin[["Emetteur", "Famille"]], df_corp[["Emetteur", "Famille"]]], ignore_index=True)
+        univers = pd.DataFrame({
+            "Emetteur": combo["Emetteur"],
+            "Type": combo["Famille"],
+            "Secteur": "—",
+        })
 
     return univers, df_fin, df_corp
 
@@ -245,18 +361,24 @@ def fmt(v, kind):
 
 with st.sidebar:
     st.header("Sélection")
-    fichier = st.file_uploader("Fichier Excel (Liste_Emetteurs.xlsx)", type=["xlsx"])
+    fichier = st.file_uploader("Fichier Excel des émetteurs", type=["xlsx"])
 
-defaut = Path(__file__).parent / "Liste_Emetteurs.xlsx"
+NOMS_PAR_DEFAUT = ["Data-Emetteurs.xlsx", "Liste_Emetteurs.xlsx"]
+defaut = next((Path(__file__).parent / n for n in NOMS_PAR_DEFAUT if (Path(__file__).parent / n).exists()), None)
+
 if fichier is not None:
     contenu = fichier.getvalue()
-elif defaut.exists():
+elif defaut is not None:
     contenu = defaut.read_bytes()
 else:
-    st.info("Charge le fichier Liste_Emetteurs.xlsx dans la barre latérale pour commencer.")
+    st.info("Charge un fichier Excel des émetteurs dans la barre latérale pour commencer.")
     st.stop()
 
-univers, df_fin, df_corp = charger_donnees(contenu)
+try:
+    univers, df_fin, df_corp = charger_donnees(contenu)
+except ValueError as e:
+    st.error(str(e))
+    st.stop()
 resultats = pd.concat([df_fin, df_corp], ignore_index=True)
 
 # Jointure avec l'univers pour récupérer Type et Secteur
