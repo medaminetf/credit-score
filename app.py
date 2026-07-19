@@ -2,19 +2,26 @@
 """
 Notation AFRICAPITAL des émetteurs de dette privée
 ---------------------------------------------------
-Application Streamlit : lit le fichier Liste_Emetteurs.xlsx (feuilles
-"Feuil1", "financier", "corporate"), calcule les 3 ratios par famille
-d'émetteur, convertit chaque ratio en note (A/B/C/D), calcule la note
-globale (moyenne des points A=4, B=3, C=2, D=1) et affiche le résultat.
 
-Lancement :  streamlit run app.py
+Fonctionnement :
+1. Le fichier "Liste_Emetteurs (2).xlsx" est conservé dans le même dossier
+   que ce fichier app.py. Il contient le référentiel des émetteurs :
+   nom, type et secteur.
+2. L'utilisateur charge depuis l'interface Streamlit le fichier de données
+   contenant les feuilles "financier" et "corporate".
+3. L'application calcule les ratios, les notes et la note globale.
+
+Lancement : streamlit run app.py
 """
 
 import io
+import re
+import unicodedata
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+
 
 # ----------------------------------------------------------------------------
 # Configuration générale
@@ -30,11 +37,36 @@ NAVY = "#1F2A44"
 GOLD = "#C9A227"
 
 RATING_META = {
-    "A": {"color": "#16A34A", "bg": "#F0FDF4", "border": "#86EFAC", "label": "Qualité de crédit forte"},
-    "B": {"color": "#2563EB", "bg": "#EFF6FF", "border": "#93C5FD", "label": "Qualité de crédit satisfaisante"},
-    "C": {"color": "#D97706", "bg": "#FFFBEB", "border": "#FCD34D", "label": "Sous surveillance"},
-    "D": {"color": "#DC2626", "bg": "#FEF2F2", "border": "#FCA5A5", "label": "Qualité de crédit dégradée"},
-    "N/A": {"color": "#6B7280", "bg": "#F9FAFB", "border": "#D1D5DB", "label": "Données non disponibles"},
+    "A": {
+        "color": "#16A34A",
+        "bg": "#F0FDF4",
+        "border": "#86EFAC",
+        "label": "Qualité de crédit forte",
+    },
+    "B": {
+        "color": "#2563EB",
+        "bg": "#EFF6FF",
+        "border": "#93C5FD",
+        "label": "Qualité de crédit satisfaisante",
+    },
+    "C": {
+        "color": "#D97706",
+        "bg": "#FFFBEB",
+        "border": "#FCD34D",
+        "label": "Sous surveillance",
+    },
+    "D": {
+        "color": "#DC2626",
+        "bg": "#FEF2F2",
+        "border": "#FCA5A5",
+        "label": "Qualité de crédit dégradée",
+    },
+    "N/A": {
+        "color": "#6B7280",
+        "bg": "#F9FAFB",
+        "border": "#D1D5DB",
+        "label": "Données non disponibles",
+    },
 }
 
 POINTS = {"A": 4, "B": 3, "C": 2, "D": 1}
@@ -69,77 +101,102 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
 # ----------------------------------------------------------------------------
-# Moteur de notation (conforme au PDF « Méthodologie Notation AFRICAPITAL »)
+# Moteur de notation
 # ----------------------------------------------------------------------------
+
 
 def note_solvabilite(x):
-    """Fonds propres / total actif (proxy du ratio réglementaire)."""
-    if x is None: return "N/A"
+    """Fonds propres / total actif."""
+    if x is None:
+        return "N/A"
     return "A" if x >= 0.10 else "B" if x >= 0.08 else "C" if x >= 0.06 else "D"
 
+
 def note_exigible_pnb(x):
-    """Total exigible / PNB — un levier faible est meilleur (PDF : ≤20x = A)."""
-    if x is None: return "N/A"
+    """Total exigible / PNB — un levier faible est meilleur."""
+    if x is None:
+        return "N/A"
     return "A" if x <= 20 else "B" if x <= 30 else "C" if x <= 40 else "D"
 
+
 def note_marge_intermediation(x):
-    """Produits d'intérêts / Charges d'intérêts."""
-    if x is None: return "N/A"
+    """Produits d'intérêts / charges d'intérêts."""
+    if x is None:
+        return "N/A"
     return "A" if x >= 2.5 else "B" if x >= 2 else "C" if x >= 1.5 else "D"
 
+
 def note_gearing(x):
-    """Dette nette / Fonds propres."""
-    if x is None: return "N/A"
+    """Dette nette / fonds propres."""
+    if x is None:
+        return "N/A"
     return "A" if x <= 0.5 else "B" if x <= 0.7 else "C" if x <= 0.9 else "D"
 
+
 def note_dn_ebitda(x):
-    """Dette nette / EBITDA (années de désendettement)."""
-    if x is None: return "N/A"
+    """Dette nette / EBITDA."""
+    if x is None:
+        return "N/A"
     return "A" if x <= 1 else "B" if x <= 2 else "C" if x <= 4 else "D"
 
+
 def note_couverture(x):
-    """EBITDA / Frais financiers."""
-    if x is None: return "N/A"
+    """EBITDA / frais financiers."""
+    if x is None:
+        return "N/A"
     return "A" if x >= 15 else "B" if x >= 10 else "C" if x >= 5 else "D"
 
+
 def note_globale(notes):
-    """Moyenne des points (A=4 … D=1) reconvertie en lettre."""
+    """Moyenne des points A=4, B=3, C=2, D=1, reconvertie en lettre."""
     pts = [POINTS[n] for n in notes if n in POINTS]
     if len(pts) < 3:
         return None, "N/A"
-    m = sum(pts) / len(pts)
-    lettre = "A" if m >= 3.5 else "B" if m >= 2.5 else "C" if m >= 1.5 else "D"
-    return round(m, 2), lettre
+
+    moyenne = sum(pts) / len(pts)
+    lettre = (
+        "A"
+        if moyenne >= 3.5
+        else "B"
+        if moyenne >= 2.5
+        else "C"
+        if moyenne >= 1.5
+        else "D"
+    )
+    return round(moyenne, 2), lettre
+
 
 def _num(v):
-    """Convertit une cellule en float, None si vide/non numérique."""
+    """Convertit une cellule en float. Renvoie None si elle est vide ou non numérique."""
     if v is None or (isinstance(v, str) and not v.strip()):
         return None
+
     try:
         f = float(v)
-        return None if f != f else f  # exclut les NaN
+        return None if f != f else f
     except (TypeError, ValueError):
         return None
 
+
 def _div(a, b):
+    """Division sécurisée."""
     if a is None or b in (None, 0):
         return None
     return a / b
 
-# ----------------------------------------------------------------------------
-# Lecture robuste du fichier Excel — s'adapte à différentes mises en forme
-# (nom des feuilles, ligne d'en-tête, ordre/orthographe des colonnes)
-# ----------------------------------------------------------------------------
 
-import re
-import unicodedata
+# ----------------------------------------------------------------------------
+# Lecture robuste des fichiers Excel
+# ----------------------------------------------------------------------------
 
 
 def _norm(s):
     """Normalise un libellé : sans accents, minuscules, espaces compactés."""
     if s is None:
         return ""
+
     s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
     s = s.lower().strip()
     s = re.sub(r"[’']", "'", s)
@@ -147,194 +204,333 @@ def _norm(s):
     return s
 
 
-# Alias possibles pour chaque champ requis (on matche par normalisation)
 ALIASES = {
-    "societes":              ["societes", "societe", "emetteur", "emetteurs"],
-    "capitaux_propres":      ["capitaux propres", "capitaux propre"],
-    "total_actif":           ["total actif", "total actifs"],
-    "dettes_subordonnees":   ["dettes subordonnees", "dette subordonnee"],
-    "etablissements_credit": ["etablissements de credits", "etablissement de credit", "etablissements de credit"],
-    "dettes_clientele":      ["dettes envers la clientele", "dette envers la clientele"],
-    "autres_dettes_titre":   ["autre dettes representees par un titre", "autres dettes representees par un titre"],
-    "pnb":                   ["produit net bancaire", "pnb"],
-    "produits_interet":      ["produits d'interet", "produit d'interet"],
-    "charges_interet":       ["charges d'interets", "charge d'interets", "charges d'interet"],
-    "dette_nette":           ["dette nette"],
+    "societes": ["societes", "societe", "emetteur", "emetteurs"],
+    "capitaux_propres": ["capitaux propres", "capitaux propre"],
+    "total_actif": ["total actif", "total actifs"],
+    "dettes_subordonnees": ["dettes subordonnees", "dette subordonnee"],
+    "etablissements_credit": [
+        "etablissements de credits",
+        "etablissement de credit",
+        "etablissements de credit",
+    ],
+    "dettes_clientele": ["dettes envers la clientele", "dette envers la clientele"],
+    "autres_dettes_titre": [
+        "autre dettes representees par un titre",
+        "autres dettes representees par un titre",
+    ],
+    "pnb": ["produit net bancaire", "pnb"],
+    "produits_interet": ["produits d'interet", "produit d'interet"],
+    "charges_interet": [
+        "charges d'interets",
+        "charge d'interets",
+        "charges d'interet",
+    ],
+    "dette_nette": ["dette nette"],
     "resultat_exploitation": ["resultat d'exploitation", "resultat dexploitation"],
-    "ebitda":                ["ebitda"],
-    "frais_financiers":      ["charges d'interet (frais financiers)", "frais financiers",
-                              "charges d'interets (frais financiers)"],
-    "type":                  ["type"],
-    "secteur":               ["secteur"],
+    "ebitda": ["ebitda"],
+    "frais_financiers": [
+        "charges d'interet (frais financiers)",
+        "frais financiers",
+        "charges d'interets (frais financiers)",
+    ],
+    "type": ["type"],
+    "secteur": ["secteur"],
 }
 
 
 def _map_columns(columns):
-    """Associe chaque clé canonique (ALIASES) à son nom de colonne réel, si présent."""
+    """Associe chaque clé canonique à son nom de colonne réel."""
     norm_map = {c: _norm(c) for c in columns}
     mapping = {}
+
     for key, aliases in ALIASES.items():
         aliases_norm = {_norm(a) for a in aliases}
-        for orig, norm in norm_map.items():
-            if norm in aliases_norm:
-                mapping[key] = orig
+        for original, normalise in norm_map.items():
+            if normalise in aliases_norm:
+                mapping[key] = original
                 break
+
     return mapping
 
 
-def _detect_header_row(ws, max_scan=5):
-    """Trouve la ligne (1-indexée) contenant l'en-tête 'Societes'/'Emetteur'."""
+def _detect_header_row(ws, max_scan=10):
+    """Trouve la ligne contenant l'en-tête Société/Émetteur."""
     societes_aliases = {_norm(a) for a in ALIASES["societes"]}
-    for r in range(1, max_scan + 1):
-        for cell in ws[r]:
-            if _norm(cell.value) in societes_aliases:
-                return r
-    return 1  # repli : première ligne
+
+    for numero_ligne in range(1, max_scan + 1):
+        for cellule in ws[numero_ligne]:
+            if _norm(cellule.value) in societes_aliases:
+                return numero_ligne
+
+    return 1
 
 
 def _find_sheet(sheetnames, keywords):
-    """Trouve la première feuille dont le nom normalisé contient un des mots-clés."""
-    for name in sheetnames:
-        n = _norm(name)
-        if any(k in n for k in keywords):
-            return name
+    """Trouve la première feuille dont le nom contient un mot-clé."""
+    for nom in sheetnames:
+        nom_normalise = _norm(nom)
+        if any(mot in nom_normalise for mot in keywords):
+            return nom
+
     return None
 
 
-@st.cache_data(show_spinner=False)
-def charger_donnees(contenu: bytes):
+def _lire_referentiel(contenu_base: bytes):
+    """Lit le fichier fixe Liste_Emetteurs (2).xlsx présent dans Git."""
     import openpyxl
 
-    wb = openpyxl.load_workbook(io.BytesIO(contenu), read_only=True, data_only=True)
-    sheetnames = wb.sheetnames
+    wb_base = openpyxl.load_workbook(
+        io.BytesIO(contenu_base),
+        read_only=True,
+        data_only=True,
+    )
 
-    sheet_fin = _find_sheet(sheetnames, ["financ"])
-    sheet_corp = _find_sheet(sheetnames, ["corporate", "corpo"])
-    sheet_univers = _find_sheet(sheetnames, ["feuil1", "univers", "liste"])
+    sheet_univers = _find_sheet(
+        wb_base.sheetnames,
+        ["feuil1", "univers", "liste", "emetteur"],
+    )
+
+    # Si aucun nom de feuille ne correspond, on utilise la première feuille.
+    if sheet_univers is None and wb_base.sheetnames:
+        sheet_univers = wb_base.sheetnames[0]
+
+    if sheet_univers is None:
+        raise ValueError(
+            "Le fichier de base Liste_Emetteurs (2).xlsx ne contient aucune feuille."
+        )
+
+    header_u = _detect_header_row(wb_base[sheet_univers])
+    xls_base = pd.ExcelFile(io.BytesIO(contenu_base))
+
+    raw_u = pd.read_excel(
+        xls_base,
+        sheet_name=sheet_univers,
+        header=header_u - 1,
+    )
+
+    raw_u.columns = [str(c).strip() for c in raw_u.columns]
+    raw_u = raw_u.loc[:, ~raw_u.columns.str.startswith("Unnamed")]
+    cmap_u = _map_columns(raw_u.columns)
+
+    if "societes" not in cmap_u:
+        raise ValueError(
+            "La colonne 'Émetteur' ou 'Sociétés' est introuvable dans "
+            "Liste_Emetteurs (2).xlsx."
+        )
+
+    emetteurs = raw_u[cmap_u["societes"]]
+
+    univers = pd.DataFrame(
+        {
+            "Emetteur": emetteurs,
+            "Type": raw_u[cmap_u["type"]] if "type" in cmap_u else "—",
+            "Secteur": raw_u[cmap_u["secteur"]] if "secteur" in cmap_u else "—",
+        }
+    )
+
+    univers = univers.dropna(subset=["Emetteur"]).copy()
+    univers["Emetteur"] = univers["Emetteur"].astype(str).str.strip()
+    univers["Type"] = univers["Type"].fillna("—").astype(str).str.strip()
+    univers["Secteur"] = univers["Secteur"].fillna("—").astype(str).str.strip()
+
+    univers = univers[
+        (univers["Emetteur"].str.len() > 0)
+        & (univers["Emetteur"].str.lower() != "nan")
+    ]
+
+    univers = univers.drop_duplicates(subset=["Emetteur"], keep="first")
+
+    return univers
+
+
+@st.cache_data(show_spinner=False)
+def charger_donnees(contenu_base: bytes, contenu_data: bytes):
+    """
+    Lit deux fichiers distincts :
+    - contenu_base : référentiel Émetteur / Type / Secteur ;
+    - contenu_data : données financières à analyser.
+    """
+    import openpyxl
+
+    # ------------------------------------------------------------------------
+    # 1. Référentiel fixe présent dans Git
+    # ------------------------------------------------------------------------
+    univers = _lire_referentiel(contenu_base)
+
+    # ------------------------------------------------------------------------
+    # 2. Fichier de données chargé par l'utilisateur
+    # ------------------------------------------------------------------------
+    wb_data = openpyxl.load_workbook(
+        io.BytesIO(contenu_data),
+        read_only=True,
+        data_only=True,
+    )
+
+    sheet_fin = _find_sheet(wb_data.sheetnames, ["financ"])
+    sheet_corp = _find_sheet(wb_data.sheetnames, ["corporate", "corpo"])
 
     if sheet_fin is None or sheet_corp is None:
         raise ValueError(
-            "Impossible de repérer les feuilles 'financier' et 'corporate' dans ce fichier. "
-            f"Feuilles trouvées : {sheetnames}"
+            "Le fichier chargé doit contenir les feuilles 'financier' et "
+            f"'corporate'. Feuilles trouvées : {wb_data.sheetnames}"
         )
 
-    xls = pd.ExcelFile(io.BytesIO(contenu))
+    xls_data = pd.ExcelFile(io.BytesIO(contenu_data))
 
-    # --- Univers (optionnel) ----------------------------------------------
-    univers = None
-    if sheet_univers is not None:
-        header_u = _detect_header_row(wb[sheet_univers])
-        raw_u = pd.read_excel(xls, sheet_univers, header=header_u - 1)
-        raw_u.columns = [str(c).strip() for c in raw_u.columns]
-        cmap_u = _map_columns(raw_u.columns)
-        if "societes" in cmap_u:
-            univers = pd.DataFrame({
-                "Emetteur": raw_u[cmap_u["societes"]].astype(str).str.strip(),
-                "Type": raw_u[cmap_u["type"]] if "type" in cmap_u else None,
-                "Secteur": raw_u[cmap_u["secteur"]] if "secteur" in cmap_u else None,
-            }).dropna(subset=["Emetteur"])
-            univers = univers[univers["Emetteur"].str.len() > 0]
+    # ------------------------------------------------------------------------
+    # Sociétés financières
+    # ------------------------------------------------------------------------
+    header_f = _detect_header_row(wb_data[sheet_fin])
 
-    # --- Sociétés financières ----------------------------------------------
-    header_f = _detect_header_row(wb[sheet_fin])
-    fin_raw = pd.read_excel(xls, sheet_fin, header=header_f - 1)
+    fin_raw = pd.read_excel(
+        xls_data,
+        sheet_name=sheet_fin,
+        header=header_f - 1,
+    )
+
     fin_raw.columns = [str(c).strip() for c in fin_raw.columns]
     fin_raw = fin_raw.loc[:, ~fin_raw.columns.str.startswith("Unnamed")]
     cmap_f = _map_columns(fin_raw.columns)
 
+    if "societes" not in cmap_f:
+        raise ValueError(
+            f"La colonne 'Émetteur' ou 'Sociétés' est introuvable dans la feuille '{sheet_fin}'."
+        )
+
     def g(row, key):
-        col = cmap_f.get(key)
-        return _num(row.get(col)) if col else None
+        colonne = cmap_f.get(key)
+        return _num(row.get(colonne)) if colonne else None
 
     fin_rows = []
-    for _, r in fin_raw.iterrows():
-        nom = r.get(cmap_f.get("societes"))
+
+    for _, ligne in fin_raw.iterrows():
+        nom = ligne.get(cmap_f.get("societes"))
+
         if not isinstance(nom, str) or not nom.strip():
             continue
-        cp   = g(r, "capitaux_propres")
-        ta   = g(r, "total_actif")
-        dsub = g(r, "dettes_subordonnees")
-        ec   = g(r, "etablissements_credit")
-        dcl  = g(r, "dettes_clientele")
-        adt  = g(r, "autres_dettes_titre")
-        pnb  = g(r, "pnb")
-        pi   = g(r, "produits_interet")
-        ci   = g(r, "charges_interet")
+
+        cp = g(ligne, "capitaux_propres")
+        ta = g(ligne, "total_actif")
+        dsub = g(ligne, "dettes_subordonnees")
+        ec = g(ligne, "etablissements_credit")
+        dcl = g(ligne, "dettes_clientele")
+        adt = g(ligne, "autres_dettes_titre")
+        pnb = g(ligne, "pnb")
+        pi = g(ligne, "produits_interet")
+        ci = g(ligne, "charges_interet")
 
         exigible = None
-        parts = [dsub, ec, dcl, adt]
-        if any(p is not None for p in parts):
-            exigible = sum(p for p in parts if p is not None)
+        parties_exigible = [dsub, ec, dcl, adt]
 
-        r1 = _div(cp, ta)          # ratio de solvabilité (proxy)
-        r2 = _div(exigible, pnb)   # total exigible / PNB
-        r3 = _div(pi, ci)          # produits / charges d'intérêts
+        if any(partie is not None for partie in parties_exigible):
+            exigible = sum(
+                partie for partie in parties_exigible if partie is not None
+            )
 
-        n1, n2, n3 = note_solvabilite(r1), note_exigible_pnb(r2), note_marge_intermediation(r3)
-        moy, lettre = note_globale([n1, n2, n3])
+        ratio_1 = _div(cp, ta)
+        ratio_2 = _div(exigible, pnb)
+        ratio_3 = _div(pi, ci)
 
-        fin_rows.append({
-            "Emetteur": nom.strip(), "Famille": "Société financière",
-            "Ratio 1": r1, "Ratio 2": r2, "Ratio 3": r3,
-            "Note 1": n1, "Note 2": n2, "Note 3": n3,
-            "Score": moy, "Note finale": lettre,
-        })
+        note_1 = note_solvabilite(ratio_1)
+        note_2 = note_exigible_pnb(ratio_2)
+        note_3 = note_marge_intermediation(ratio_3)
+
+        moyenne, lettre = note_globale([note_1, note_2, note_3])
+
+        fin_rows.append(
+            {
+                "Emetteur": nom.strip(),
+                "Famille": "Société financière",
+                "Ratio 1": ratio_1,
+                "Ratio 2": ratio_2,
+                "Ratio 3": ratio_3,
+                "Note 1": note_1,
+                "Note 2": note_2,
+                "Note 3": note_3,
+                "Score": moyenne,
+                "Note finale": lettre,
+            }
+        )
+
     df_fin = pd.DataFrame(fin_rows)
 
-    # --- Corporates ----------------------------------------------------------
-    header_c = _detect_header_row(wb[sheet_corp])
-    corp_raw = pd.read_excel(xls, sheet_corp, header=header_c - 1)
+    # ------------------------------------------------------------------------
+    # Corporates
+    # ------------------------------------------------------------------------
+    header_c = _detect_header_row(wb_data[sheet_corp])
+
+    corp_raw = pd.read_excel(
+        xls_data,
+        sheet_name=sheet_corp,
+        header=header_c - 1,
+    )
+
     corp_raw.columns = [str(c).strip() for c in corp_raw.columns]
     corp_raw = corp_raw.loc[:, ~corp_raw.columns.str.startswith("Unnamed")]
     cmap_c = _map_columns(corp_raw.columns)
 
+    if "societes" not in cmap_c:
+        raise ValueError(
+            f"La colonne 'Émetteur' ou 'Sociétés' est introuvable dans la feuille '{sheet_corp}'."
+        )
+
     def gc(row, key):
-        col = cmap_c.get(key)
-        return _num(row.get(col)) if col else None
+        colonne = cmap_c.get(key)
+        return _num(row.get(colonne)) if colonne else None
 
     corp_rows = []
-    for _, r in corp_raw.iterrows():
-        nom = r.get(cmap_c.get("societes"))
+
+    for _, ligne in corp_raw.iterrows():
+        nom = ligne.get(cmap_c.get("societes"))
+
         if not isinstance(nom, str) or not nom.strip():
             continue
-        cp     = gc(r, "capitaux_propres")
-        dn     = gc(r, "dette_nette")
-        rex    = gc(r, "resultat_exploitation")
-        ebitda = gc(r, "ebitda")
-        ff     = gc(r, "frais_financiers")
 
-        # EBITDA de repli : résultat d'exploitation si l'EBITDA manque
+        cp = gc(ligne, "capitaux_propres")
+        dette_nette = gc(ligne, "dette_nette")
+        resultat_exploitation = gc(ligne, "resultat_exploitation")
+        ebitda = gc(ligne, "ebitda")
+        frais_financiers = gc(ligne, "frais_financiers")
+
+        # Si l'EBITDA est absent, on utilise le résultat d'exploitation.
         if ebitda is None:
-            ebitda = rex
+            ebitda = resultat_exploitation
 
-        r1 = _div(dn, cp)        # gearing
-        r2 = _div(dn, ebitda)    # dette nette / EBITDA
-        r3 = _div(ebitda, ff)    # EBITDA / frais financiers
+        ratio_1 = _div(dette_nette, cp)
+        ratio_2 = _div(dette_nette, ebitda)
+        ratio_3 = _div(ebitda, frais_financiers)
 
-        n1, n2, n3 = note_gearing(r1), note_dn_ebitda(r2), note_couverture(r3)
-        moy, lettre = note_globale([n1, n2, n3])
+        note_1 = note_gearing(ratio_1)
+        note_2 = note_dn_ebitda(ratio_2)
+        note_3 = note_couverture(ratio_3)
 
-        corp_rows.append({
-            "Emetteur": nom.strip(), "Famille": "Corporate",
-            "Ratio 1": r1, "Ratio 2": r2, "Ratio 3": r3,
-            "Note 1": n1, "Note 2": n2, "Note 3": n3,
-            "Score": moy, "Note finale": lettre,
-        })
+        moyenne, lettre = note_globale([note_1, note_2, note_3])
+
+        corp_rows.append(
+            {
+                "Emetteur": nom.strip(),
+                "Famille": "Corporate",
+                "Ratio 1": ratio_1,
+                "Ratio 2": ratio_2,
+                "Ratio 3": ratio_3,
+                "Note 1": note_1,
+                "Note 2": note_2,
+                "Note 3": note_3,
+                "Score": moyenne,
+                "Note finale": lettre,
+            }
+        )
+
     df_corp = pd.DataFrame(corp_rows)
-
-    # --- Univers de repli : si aucune feuille Type/Secteur n'existe --------
-    if univers is None:
-        combo = pd.concat([df_fin[["Emetteur", "Famille"]], df_corp[["Emetteur", "Famille"]]], ignore_index=True)
-        univers = pd.DataFrame({
-            "Emetteur": combo["Emetteur"],
-            "Type": combo["Famille"],
-            "Secteur": "—",
-        })
 
     return univers, df_fin, df_corp
 
 
-# Libellés des indicateurs par famille
+# ----------------------------------------------------------------------------
+# Libellés et formatage
+# ----------------------------------------------------------------------------
+
 LIBELLES = {
     "Société financière": [
         ("Ratio de solvabilité", "pct"),
@@ -348,70 +544,153 @@ LIBELLES = {
     ],
 }
 
+
 def fmt(v, kind):
     if v is None or pd.isna(v):
         return "—"
+
     if kind == "pct":
         return f"{v * 100:.1f}%".replace(".", ",")
+
     return f"{v:.1f}x".replace(".", ",")
 
+
 # ----------------------------------------------------------------------------
-# Interface
+# Interface Streamlit
 # ----------------------------------------------------------------------------
+
+# Nom exact du fichier de base conservé dans Git.
+FICHIER_BASE = Path(__file__).parent / "Liste_Emetteurs (2).xlsx"
 
 with st.sidebar:
     st.header("Sélection")
-    fichier = st.file_uploader("Fichier Excel des émetteurs", type=["xlsx"])
 
-NOMS_PAR_DEFAUT = ["Data-Emetteurs.xlsx", "Liste_Emetteurs (2).xlsx"]
-defaut = next((Path(__file__).parent / n for n in NOMS_PAR_DEFAUT if (Path(__file__).parent / n).exists()), None)
+    fichier_data = st.file_uploader(
+        "Charger le fichier Data-Emetteurs",
+        type=["xlsx"],
+        help=(
+            "Ce fichier doit contenir les feuilles 'financier' et 'corporate'. "
+            "Le référentiel Émetteur / Type / Secteur est lu automatiquement "
+            "depuis Liste_Emetteurs (2).xlsx."
+        ),
+    )
 
-if fichier is not None:
-    contenu = fichier.getvalue()
-elif defaut is not None:
-    contenu = defaut.read_bytes()
-else:
-    st.info("Charge un fichier Excel des émetteurs dans la barre latérale pour commencer.")
+# Vérification du fichier fixe présent dans le dépôt Git.
+if not FICHIER_BASE.exists():
+    st.error(
+        "Le fichier de base 'Liste_Emetteurs (2).xlsx' est introuvable. "
+        "Placez-le dans le même dossier que app.py."
+    )
     st.stop()
+
+contenu_base = FICHIER_BASE.read_bytes()
+
+# Le fichier de données doit être chargé par l'utilisateur.
+if fichier_data is None:
+    st.info(
+        "Le référentiel des émetteurs est prêt. Chargez maintenant le fichier "
+        "Data-Emetteurs.xlsx dans la barre latérale pour lancer l'analyse."
+    )
+    st.stop()
+
+contenu_data = fichier_data.getvalue()
 
 try:
-    univers, df_fin, df_corp = charger_donnees(contenu)
-except ValueError as e:
-    st.error(str(e))
+    univers, df_fin, df_corp = charger_donnees(
+        contenu_base,
+        contenu_data,
+    )
+except Exception as erreur:
+    st.error(f"Impossible de lire les fichiers : {erreur}")
     st.stop()
-resultats = pd.concat([df_fin, df_corp], ignore_index=True)
 
-# Jointure avec l'univers pour récupérer Type et Secteur
-univers_idx = univers.set_index(univers["Emetteur"].str.upper().str.strip())
+# Assemblage des résultats calculés.
+frames_non_vides = [df for df in [df_fin, df_corp] if not df.empty]
 
-def info_univers(nom):
-    key = nom.upper().strip()
-    # correspondance exacte puis partielle (ex. "CIH" vs "CIH Bank")
-    if key in univers_idx.index:
-        row = univers_idx.loc[key]
-    else:
-        match = univers_idx[univers_idx.index.str.contains(key, regex=False)]
-        if match.empty:
-            return "—", "—"
-        row = match.iloc[0]
-    if isinstance(row, pd.DataFrame):
-        row = row.iloc[0]
-    return row.get("Type", "—"), row.get("Secteur", "—")
+if not frames_non_vides:
+    st.warning("Aucune donnée exploitable n'a été trouvée dans le fichier chargé.")
+    st.stop()
 
-resultats[["Type", "Secteur"]] = resultats["Emetteur"].apply(
-    lambda n: pd.Series(info_univers(n))
+resultats = pd.concat(frames_non_vides, ignore_index=True)
+
+
+# ----------------------------------------------------------------------------
+# Jointure entre résultats et référentiel Type / Secteur
+# ----------------------------------------------------------------------------
+
+univers = univers.copy()
+univers["Cle_emetteur"] = univers["Emetteur"].map(_norm)
+
+# Évite les doublons d'index dans le référentiel.
+univers_idx = (
+    univers.drop_duplicates(subset=["Cle_emetteur"], keep="first")
+    .set_index("Cle_emetteur")
 )
 
-with st.sidebar:
-    types_dispo = sorted(univers["Type"].dropna().unique().tolist())
-    types_sel = st.multiselect("Type d'émetteur", types_dispo, default=types_dispo)
 
-    dispo = resultats[resultats["Type"].isin(types_sel)] if types_sel else resultats
-    notes_ok = dispo[dispo["Note finale"] != "N/A"]
-    choix = notes_ok["Emetteur"].tolist() or dispo["Emetteur"].tolist()
+def info_univers(nom):
+    cle = _norm(nom)
+
+    # Correspondance exacte.
+    if cle in univers_idx.index:
+        ligne_univers = univers_idx.loc[cle]
+        return ligne_univers.get("Type", "—"), ligne_univers.get("Secteur", "—")
+
+    # Correspondance partielle dans les deux sens.
+    correspondances = univers_idx[
+        univers_idx.index.to_series().apply(
+            lambda valeur: cle in valeur or valeur in cle
+        )
+    ]
+
+    if correspondances.empty:
+        return "—", "—"
+
+    ligne_univers = correspondances.iloc[0]
+    return ligne_univers.get("Type", "—"), ligne_univers.get("Secteur", "—")
+
+
+resultats[["Type", "Secteur"]] = resultats["Emetteur"].apply(
+    lambda nom: pd.Series(info_univers(nom))
+)
+
+
+# ----------------------------------------------------------------------------
+# Filtres de la barre latérale
+# ----------------------------------------------------------------------------
+
+with st.sidebar:
+    types_dispo = sorted(
+        type_emetteur
+        for type_emetteur in univers["Type"].dropna().unique().tolist()
+        if str(type_emetteur).strip()
+    )
+
+    types_sel = st.multiselect(
+        "Type d'émetteur",
+        types_dispo,
+        default=types_dispo,
+    )
+
+    if types_sel:
+        disponibles = resultats[resultats["Type"].isin(types_sel)]
+    else:
+        disponibles = resultats
+
+    notes_ok = disponibles[disponibles["Note finale"] != "N/A"]
+    choix = notes_ok["Emetteur"].tolist() or disponibles["Emetteur"].tolist()
+
     emetteur = st.selectbox("Émetteur", choix) if choix else None
 
-st.markdown('<div class="acm-title">Notation AFRICAPITAL des émetteurs de dette privée</div>', unsafe_allow_html=True)
+
+# ----------------------------------------------------------------------------
+# Affichage principal
+# ----------------------------------------------------------------------------
+
+st.markdown(
+    '<div class="acm-title">Notation AFRICAPITAL des émetteurs de dette privée</div>',
+    unsafe_allow_html=True,
+)
 st.markdown("---")
 
 if emetteur is None:
@@ -420,21 +699,28 @@ if emetteur is None:
 
 ligne = resultats[resultats["Emetteur"] == emetteur].iloc[0]
 note = ligne["Note finale"] if pd.notna(ligne["Note finale"]) else "N/A"
-meta = RATING_META[note]
+meta = RATING_META.get(note, RATING_META["N/A"])
 
-# --- En-tête émetteur + carte de notation -----------------------------------
+# En-tête émetteur et carte de notation.
 c1, c2 = st.columns([3, 1])
+
 with c1:
-    st.markdown(f'<div class="acm-issuer">{emetteur}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="acm-issuer">{emetteur}</div>',
+        unsafe_allow_html=True,
+    )
+
     st.markdown(
         f'<span class="acm-badge">{ligne["Type"]}</span>'
         f'<span class="acm-sector">Secteur : {ligne["Secteur"]}</span>',
         unsafe_allow_html=True,
     )
+
 with c2:
     st.markdown(
         f"""
-        <div class="rating-card" style="background:{meta['bg']}; border-color:{meta['border']};">
+        <div class="rating-card"
+             style="background:{meta['bg']}; border-color:{meta['border']};">
           <div class="rating-letter" style="color:{meta['color']};">{note}</div>
           <div class="rating-label">{meta['label']}</div>
         </div>
@@ -445,58 +731,109 @@ with c2:
 if ligne["Score"] is not None and pd.notna(ligne["Score"]):
     st.caption(f"Score moyen : {str(ligne['Score']).replace('.', ',')} / 4")
 
-# --- Indicateurs clés --------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# Indicateurs clés
+# ----------------------------------------------------------------------------
+
 st.markdown("### Indicateurs clés")
 libelles = LIBELLES[ligne["Famille"]]
-fmt1 = "pct" if ligne["Famille"] == "Société financière" else libelles[0][1]
 
-cols = st.columns(3)
-for col, (lib, kind), rk, nk in zip(
-    cols, libelles, ["Ratio 1", "Ratio 2", "Ratio 3"], ["Note 1", "Note 2", "Note 3"]
+colonnes = st.columns(3)
+
+for colonne, (libelle, format_ratio), cle_ratio, cle_note in zip(
+    colonnes,
+    libelles,
+    ["Ratio 1", "Ratio 2", "Ratio 3"],
+    ["Note 1", "Note 2", "Note 3"],
 ):
-    n = ligne[nk]
-    couleur = RATING_META.get(n, RATING_META["N/A"])["color"]
-    with col:
+    note_ratio = ligne[cle_note]
+    couleur = RATING_META.get(note_ratio, RATING_META["N/A"])["color"]
+
+    with colonne:
         st.markdown(
             f"""
-            <div class="kpi-label">{lib}</div>
-            <div class="kpi-value">{fmt(ligne[rk], kind)}</div>
-            <div class="kpi-note" style="color:{couleur};">Note : {n}</div>
+            <div class="kpi-label">{libelle}</div>
+            <div class="kpi-value">{fmt(ligne[cle_ratio], format_ratio)}</div>
+            <div class="kpi-note" style="color:{couleur};">Note : {note_ratio}</div>
             """,
             unsafe_allow_html=True,
         )
 
 st.markdown("---")
 
-# --- Univers des émetteurs notés --------------------------------------------
+
+# ----------------------------------------------------------------------------
+# Tableau de l'univers noté
+# ----------------------------------------------------------------------------
+
 st.markdown("### Univers des émetteurs notés")
 
 tableau = resultats[resultats["Note finale"] != "N/A"][
-    ["Emetteur", "Type", "Secteur", "Note 1", "Note 2", "Note 3", "Score", "Note finale"]
-].rename(columns={"Emetteur": "Émetteur", "Note finale": "Note"})
+    [
+        "Emetteur",
+        "Type",
+        "Secteur",
+        "Note 1",
+        "Note 2",
+        "Note 3",
+        "Score",
+        "Note finale",
+    ]
+].rename(
+    columns={
+        "Emetteur": "Émetteur",
+        "Note finale": "Note",
+    }
+)
+
 
 def couleur_note(v):
-    meta = RATING_META.get(v)
-    if meta:
-        return f"color:{meta['color']}; font-weight:700;"
+    metadata = RATING_META.get(v)
+    if metadata:
+        return f"color:{metadata['color']}; font-weight:700;"
     return ""
 
+
 st.dataframe(
-    tableau.style.map(couleur_note, subset=["Note 1", "Note 2", "Note 3", "Note"]),
+    tableau.style.map(
+        couleur_note,
+        subset=["Note 1", "Note 2", "Note 3", "Note"],
+    ),
     use_container_width=True,
     hide_index=True,
 )
 
-# --- Export Excel ------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# Export Excel
+# ----------------------------------------------------------------------------
+
 buffer = io.BytesIO()
 export = resultats[resultats["Note finale"] != "N/A"].copy()
+
 with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
     export.to_excel(writer, sheet_name="Notation", index=False)
-    wb, ws = writer.book, writer.sheets["Notation"]
-    header_fmt = wb.add_format({"bold": True, "bg_color": NAVY, "font_color": "white", "border": 1})
-    for i, col in enumerate(export.columns):
-        ws.write(0, i, col, header_fmt)
-        ws.set_column(i, i, max(14, len(str(col)) + 2))
+
+    workbook = writer.book
+    worksheet = writer.sheets["Notation"]
+
+    header_fmt = workbook.add_format(
+        {
+            "bold": True,
+            "bg_color": NAVY,
+            "font_color": "white",
+            "border": 1,
+        }
+    )
+
+    for index_colonne, nom_colonne in enumerate(export.columns):
+        worksheet.write(0, index_colonne, nom_colonne, header_fmt)
+        worksheet.set_column(
+            index_colonne,
+            index_colonne,
+            max(14, len(str(nom_colonne)) + 2),
+        )
 
 st.download_button(
     "📥 Exporter la notation (Excel)",
@@ -507,5 +844,5 @@ st.download_button(
 
 st.caption(
     "Modèle d'aide à la décision — ne se substitue ni à l'analyse fondamentale "
-    "ni aux éléments qualitatifs (gouvernance, actionnariat, position concurrentielle)."
+    "ni aux éléments qualitatifs : gouvernance, actionnariat et position concurrentielle."
 )
